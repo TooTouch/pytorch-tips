@@ -217,8 +217,8 @@ def fit(
         if args.local_rank == 0:
             _logger.info(f'\nEpoch: {epoch+1}/{epochs}')
 
-        train_metrics = train(model, trainloader, criterion, optimizer, log_interval, accumulation_steps)
-        eval_metrics = test(model, testloader, criterion, log_interval)
+        train_metrics = train(model, trainloader, criterion, optimizer, log_interval, accumulation_steps, local_rank=args.local_rank)
+        eval_metrics = test(model, testloader, criterion, log_interval, local_rank=args.local_rank)
 
         scheduler.step()
 
