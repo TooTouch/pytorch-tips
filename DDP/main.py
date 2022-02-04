@@ -6,6 +6,7 @@ import os
 import time
 import json
 import random
+import math
 import wandb
 import logging
 from collections import OrderedDict
@@ -106,7 +107,7 @@ class OrderedDistributedSampler(Sampler):
         return self.num_samples
 
 
-def train(model, dataloader, criterion, optimizer, log_interval, accumulation_steps=1):   
+def train(model, dataloader, criterion, optimizer, log_interval, accumulation_steps=1, local_rank=0):   
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     acc_m = AverageMeter()
@@ -137,17 +138,21 @@ def train(model, dataloader, criterion, optimizer, log_interval, accumulation_st
             optimizer.step()
             optimizer.zero_grad()
 
+            preds = outputs.argmax(dim=1) 
+            acc = targets.eq(preds).sum()/targets.size(0)
+            
             if args.distributed:
                 loss = reduce_tensor(loss.data, args.world_size)
+                acc = reduce_tensor(acc.data, args.world_size)
+                
             losses_m.update(loss.item()*accumulation_steps)
-
+            acc_m.update(acc.item(), n=targets.size(0))
             # accuracy
-            preds = outputs.argmax(dim=1) 
-            acc_m.update(targets.eq(preds).sum().item()/targets.size(0), n=targets.size(0))
+            
             
             batch_time_m.update(time.time() - end)
-        
-            if (idx // accumulation_steps) % log_interval == 0 and idx != 0: 
+
+            if local_rank == 0 and (idx // accumulation_steps) % log_interval == 0 and idx != 0: 
                 _logger.info('TRAIN [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
                         'Acc: {acc.avg:.3%} '
                         'LR: {lr:.3e} '
@@ -166,7 +171,7 @@ def train(model, dataloader, criterion, optimizer, log_interval, accumulation_st
     
     return OrderedDict([('acc',acc_m.avg), ('loss',losses_m.avg)])
         
-def test(model, dataloader, criterion, log_interval):
+def test(model, dataloader, criterion, log_interval, local_rank=0):
     correct = 0
     total = 0
     total_loss = 0
@@ -188,7 +193,7 @@ def test(model, dataloader, criterion, log_interval):
             correct += targets.eq(preds).sum().item()
             total += targets.size(0)
             
-            if idx % log_interval == 0 and idx != 0: 
+            if local_rank == 0 and idx % log_interval == 0 and idx != 0: 
                 _logger.info('TEST [%d/%d]: Loss: %.3f | Acc: %.3f%% [%d/%d]' % 
                             (idx+1, len(dataloader), total_loss/(idx+1), 100.*correct/total, correct, total))
                 
@@ -198,9 +203,10 @@ def fit(
     exp_name, model, epochs, trainloader, testloader, criterion, optimizer, scheduler, 
     savedir, log_interval, args, accumulation_steps=1
 ):
-    savedir = os.path.join(savedir,exp_name)
-    os.makedirs(savedir, exist_ok=True)
-    wandb.init(name=exp_name, project='DDP', config=args)
+    if args.local_rank == 0:
+        savedir = os.path.join(savedir,exp_name)
+        os.makedirs(savedir, exist_ok=True)
+        wandb.init(name=exp_name, project='DDP', config=args)
     
     best_acc = 0
 
@@ -208,31 +214,34 @@ def fit(
         if args.distributed and hasattr(trainloader.sampler, 'set_epoch'):
             trainloader.sampler.set_epoch(epoch)
 
-        _logger.info(f'\nEpoch: {epoch+1}/{epochs}')
+        if args.local_rank == 0:
+            _logger.info(f'\nEpoch: {epoch+1}/{epochs}')
+
         train_metrics = train(model, trainloader, criterion, optimizer, log_interval, accumulation_steps)
         eval_metrics = test(model, testloader, criterion, log_interval)
 
         scheduler.step()
 
         # wandb
-        metrics = OrderedDict(epoch=epoch)
-        metrics.update([('train_' + k, v) for k, v in train_metrics.items()])
-        metrics.update([('eval_' + k, v) for k, v in eval_metrics.items()])
-        wandb.log(metrics)
-    
-        # checkpoint
-        if best_acc < eval_metrics['acc']:
-            state = {'best_epoch':epoch, 'best_acc':eval_metrics['acc']}
-            json.dump(state, open(os.path.join(savedir, f'{exp_name}.json'),'w'), indent=4)
+        if args.local_rank == 0:
+            metrics = OrderedDict(epoch=epoch)
+            metrics.update([('train_' + k, v) for k, v in train_metrics.items()])
+            metrics.update([('eval_' + k, v) for k, v in eval_metrics.items()])
+            wandb.log(metrics)
+        
+            # checkpoint
+            if best_acc < eval_metrics['acc']:
+                state = {'best_epoch':epoch, 'best_acc':eval_metrics['acc']}
+                json.dump(state, open(os.path.join(savedir, f'{exp_name}.json'),'w'), indent=4)
 
-            weights = {'model':model.state_dict()}
-            torch.save(weights, os.path.join(savedir, f'{exp_name}.pt'))
-            
-            _logger.info('Best Accuracy {0:.3%} to {1:.3%}'.format(best_acc, eval_metrics['acc']))
+                weights = {'model':model.state_dict()}
+                torch.save(weights, os.path.join(savedir, f'{exp_name}.pt'))
+                _logger.info('Best Accuracy {0:.3%} to {1:.3%}'.format(best_acc, eval_metrics['acc']))
 
-            best_acc = eval_metrics['acc']
+                best_acc = eval_metrics['acc']
 
-    _logger.info('Best Metric: {0:.3%} (epoch {1:})'.format(state['best_acc'], state['best_epoch']))
+    if args.local_rank == 0:
+        _logger.info('Best Metric: {0:.3%} (epoch {1:})'.format(state['best_acc'], state['best_epoch']))
 
 
 def run(args):
@@ -278,14 +287,8 @@ def run(args):
 
     # distributed
     train_sampler = None
-    test_sampler = None
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(trainset)
-        
-        # This will add extra duplicate entries to result in equal num
-        # of samples per-process, will slightly alter validation results
-        test_sampler = OrderedDistributedSampler(testset)
-
 
     # data loader
     trainloader = DataLoader(
@@ -300,14 +303,14 @@ def run(args):
         testset, 
         batch_size  = args.batch_size, 
         shuffle     = False, 
-        num_workers = args.num_workers, 
-        sampler     = test_sampler
+        num_workers = args.num_workers
     )
 
     # Build Model
     model = ResNet50(num_classes=100)
     model.cuda()
-    _logger.info('# of params: {}'.format(np.sum([p.numel() for p in model.parameters()])))
+    if args.local_rank == 0:
+        _logger.info('# of params: {}'.format(np.sum([p.numel() for p in model.parameters()])))
 
     # setup distributed training
     if args.distributed:
@@ -351,7 +354,7 @@ if __name__=='__main__':
     parser.add_argument('--log-interval',type=int,default=10,help='log interval')
     parser.add_argument('--seed',type=int,default=223,help='223 is my birthday')
     parser.add_argument('--accumulation-steps',type=int,default=1,help='accumulation step size')
-    parser.add_argument('--local_rank',type=str,default=0,help='local rank')
+    parser.add_argument('--local_rank',type=int,default=0,help='local rank')
     parser.add_argument('--device_num',type=int,default=0, help='gpu device number')
 
     args = parser.parse_args()
