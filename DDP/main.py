@@ -57,7 +57,7 @@ def reduce_tensor(tensor, n):
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= n
     return rt
-    
+
 
 class OrderedDistributedSampler(Sampler):
     """Sampler that restricts data loading to a subset of the dataset.
@@ -200,7 +200,7 @@ def fit(
 ):
     savedir = os.path.join(savedir,exp_name)
     os.makedirs(savedir, exist_ok=True)
-    wandb.init(name=exp_name, project='Accumulation Steps', config=args)
+    wandb.init(name=exp_name, project='DDP', config=args)
     
     best_acc = 0
 
